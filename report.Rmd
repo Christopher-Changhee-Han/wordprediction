@@ -1,0 +1,247 @@
+---
+title: "Natural Language Processing: Word Prediction"
+author: "Christopher Han"
+date: "November 14, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Summary
+This data product takes in a word or a sentence and predicts the next word. The model is trained on 70% of the [dataset](https://d396qusza40orc.cloudfront.net/dsscapstone/dataset/Coursera-SwiftKey.zip) and uses a stupid backoff model with ngrams ranging from 1-5. The application is deployed at this link. https://chrishan.shinyapps.io/finalwordprediction/ 
+
+**Background**
+
+Using the user's input text to predict their next word is best illustrated by the [SwiftKey Keyboard](https://www.microsoft.com/en-us/swiftkey). By using machine learning, SwiftKey provides a convenient way to reduce typing and improve the speed of communication. Our goal is to create a crude version of SwiftKey Keyboard in which the user can input text and the algorithm returns a vector of words along with their respective predictive probabilities.
+
+This project was originally completed in February 2019 as part of the Data Science Specialization Capstone course offered on Coursera by Johns Hopkins University. This report aims to explain the process from the initial data exploration to creating the data product with the shiny application.
+ 
+
+## Exploratory Analysis
+
+```{r load, message = FALSE, cache = TRUE, message = FALSE, echo = FALSE, warning = FALSE}
+setwd("C:/Users/Chris Han/wordprediction/final/en_US")
+
+library(quanteda)
+library(plotly)
+require(readtext)
+
+# read in data
+twitter <- readLines("en_US.twitter.txt", encoding = "UTF-8")
+blogs <- readLines("en_US.blogs.txt", encoding = "UTF-8")
+news <- readLines("en_US.news.txt", encoding = "UTF-8")
+
+```
+
+I first load in three documents each from different sources: twitter, blogs, and news. Blogs file contains around 900,000 sentences, news file contains a little over a million, and twitter file contains nearly 2.4 million sentences. 10% of each text file was sampled in order to reduce computing time and consolidated the documents together to create a combined corpus. The summary of the combined corpus can be seen below.
+
+```{r consolidated, echo = FALSE, cache = TRUE}
+# sample 10% only
+set.seed(1510)
+twitter_index <- sample(1:length(twitter), length(twitter) * 0.1)
+
+set.seed(2000)
+blogs_index <- sample(1:length(blogs), length(blogs) * 0.1)
+
+set.seed(20)
+news_index <- sample(1:length(news), length(news) * 0.1)
+
+# make corpus with 10% data for each
+twitter_corpus <- corpus(twitter[twitter_index])
+blogs_corpus <- corpus(blogs[blogs_index])
+news_corpus <- corpus(news[news_index])
+
+#rm(blogs, twitter, news,
+#   blogs_index, twitter_index, news_index) # free up memory
+
+# consolidate documents into one for each
+twitter_corpus <- corpus(texts(twitter_corpus, groups = rep(1, ndoc(twitter_corpus))))
+blogs_corpus <- corpus(texts(blogs_corpus, groups = rep(1, ndoc(blogs_corpus))))
+news_corpus <- corpus(texts(news_corpus, groups = rep(1, ndoc(news_corpus))))
+
+combined_corpus <- corpus(c(twitter_corpus, blogs_corpus, news_corpus), 
+                          docnames = c("twitter", "blogs", "news"))
+summary(combined_corpus)
+```
+
+Next, I created the document frequency matrix for mono, bi, and trigrams. For the monogram model, I removed the punctuations, symbols, twitter hashtags, and common stopwords. The 50 most frequent words are displayed below.
+
+```{r 1gram, cache = TRUE, echo = FALSE}
+# create dfm for 1,2,3-gram
+
+en_dfm <- dfm(combined_corpus, 
+                remove_punct = TRUE, 
+                remove_symbols = TRUE,
+                remove_twitter = TRUE,
+                remove = stopwords())
+topfeatures(en_dfm, n = 10)
+textplot_wordcloud(en_dfm, max_words = 50)
+#barplot(topfeatures(en_dfm, n = 10), 
+#        col = "lightgreen", 
+#        ylab = "Frequency", 
+#        main = "Top 10 Most Frequent Words")
+
+
+```
+
+For bigrams, I also removed the punctuations, symbols, and twitter hashtags, but not the stopwords. 
+
+```{r 2gram, cache = TRUE, echo = FALSE}
+en_dfm_2 <- dfm(combined_corpus,
+                remove_punct = TRUE, 
+                remove_symbols = TRUE,
+                remove_twitter = TRUE,
+                ngrams = 2
+                )
+topfeatures(en_dfm_2, n = 10)
+
+barplot(topfeatures(en_dfm_2, n = 10), 
+        col = "lightgreen", 
+        ylab = "Frequency", 
+        cex.names = 0.8,
+        main = "Top 10 Most Frequent Bigrams")
+```
+
+Same goes for the trigrams.
+
+```{r 3gram, cache = TRUE, echo = FALSE}
+en_dfm_3 <- dfm(combined_corpus,
+                remove_punct = TRUE, 
+                remove_symbols = TRUE,
+                remove_twitter = TRUE,
+                ngrams = 3
+                )
+topfeatures(en_dfm_3, n = 10)
+
+barplot(topfeatures(en_dfm_3, n = 10), 
+        col = "lightgreen", 
+        ylab = "Frequency", 
+        cex.names = 0.5,
+        main = "Top 10 Most Frequent Trigrams")
+```
+
+### Building an n-gram model
+
+The first predictive model was built with a basic bigram prediction where the algorithm looks at the word before and chooses the bigram with the highest frequency containing that beginning word. For example, for the sentence "I have a car", the model looks at all the bigrams that starts with "I" and chooses the bigram with highest frequency, which happens to be "I have". Next, the model chooses the bigram starting with "have" that has the highest frequency in our corpus. 
+
+Hence, this model only looks at the word that comes right before the one I am trying to predict. The result is not so great. I predicted on two sentences "I have a beautiful car" and "who let the d0gs out". As seen below, predicting on only the previous word creates sentences that may be gramatically sound but nonsensical in their meanings. Therefore, we need a better way of predicting. 
+
+```{r, echo = FALSE, cache = TRUE}
+bigram_pred <- function(sentences, freq_matrix){
+    
+    sentences_temp <- tokens(char_tolower(sentences),
+                            remove_punct = TRUE,
+                            remove_symbols = TRUE,
+                            remove_twitter = TRUE
+                            )
+    result <- matrix(nrow = length(sentences_temp), ncol = 1)
+    
+    # for each sentence
+    for (k in 1:length(sentences_temp)){
+        finalsentence <- ""
+        # for each word
+        for (i in 1:length(sentences_temp[[k]])){
+            
+            # based on word, choose the bigram with highest probability
+            temp_pattern <- paste("^", sentences_temp[[k]][i], "_", sep = "")
+            
+            # slower method using grep, it iterates through the entire dfm, hence it's slower
+            # highest_matching_row <- freq_matrix[grep(temp_pattern, freq_matrix$feature)[1],]
+            
+            # faster method using for loop with grepl, stop after first match (highest frequency ngram)
+            highest_matching_row = 1 
+            for (a in 1:length(freq_matrix$feature)){
+                if (grepl(temp_pattern, freq_matrix$feature[a])){
+                    highest_matching_row = a
+                    break
+                }
+            }
+            
+            # assign the next word
+            highest_prob_word <- strsplit(freq_matrix$feature[highest_matching_row], split = "_")[[1]]
+            
+            # if beginning of sentence, add the first word
+            if(i == 1){
+                finalsentence <- highest_prob_word[1]
+            }
+            
+            # add the following word
+            finalsentence <- paste(finalsentence, highest_prob_word[2])
+        }
+        
+        # store the predicted sentence into the data frame
+        result[k,] <- finalsentence
+        
+    }
+    
+    # return the data frame containing the predicted sentences
+    result
+    
+}
+
+a <- c("I have a beautiful car", "who let the dOgs out")
+en_dfm_2_weighted <- dfm_weight(en_dfm_2, scheme = "prop")
+en_dfm_2_weighted_freq <- textstat_frequency(en_dfm_2_weighted)
+bigram_pred(a, en_dfm_2_weighted_freq)
+```
+
+
+
+
+## Methodology
+
+The final algorithm uses a stupid backoff model. First the model starts with a 5-gram match, given the sentence is long enough. If there is a match, the probability of the word is calculated based on the 5-gram match. If there is not a match, it moves onto 4-gram, to 3-gram, and so on. This model gives absolute priority to a higher n-gram match so it will not check other lower n-grams if there is a match already. For example, if there is a 5-gram match, regardless of the accuracy of the prediction, the model will stop and not check for 4-gram or lower n-gram matches. In most cases, this does not cause issues but is something to be wary of.
+
+**Stopwords**
+
+Stopwords are words that are very common in a language such as 'I', 'a', 'you'. Removing these words can possibly improve or worsen the prediction. The accuracy depends on the complexity of the sentence. For example, if you input a sentence such as 'I'll be on my', then the prediction with stopwords included would provide a better result since the input contains many stopwords. In contrast, if you are predicting based on a sentence such as 'Flowers and plants are both very' then it may be better to exclude the stopwords so that the algorithm predicts on the words 'flowers' and 'plants' rather than 'are both very'.
+
+### Performance of the Model
+
+Using the benchmark provided here [Benchmark](https://github.com/hfoffani/dsci-benchmark), we observed how the model performs on a test set.
+```{r, echo = FALSE}
+library(knitr)
+
+data_col <- c("Overall top-3 score", "Overall top-1 precision", "Overall top-3 precision", "Average runtime", "Total memory used")
+ffive <- c("17.56%", "13.45%", "21.02%", "23.84 msec", "106.88 MB")
+ffour <- c("17.57%", "13.41%", "21.09%", "20.08 msec", "106.51 MB")
+three <- c("17.18%", "12.77%", "20.92%", "18.20 msec", "105.32 MB")
+
+result_matrix <- data.frame(data_col, three, ffour, ffive)
+colnames(result_matrix) <- c("Result", "3-gram", "4-gram", "5-gram")
+
+kable(result_matrix)
+
+```
+
+The 5-gram model provides the best overall top-1 precision with being able to predict the next word on the first try 13.45% of the time. The final deployed application uses the 5-gram model on the basis of this result.
+
+## Shiny Application Interface
+
+The shiny application consists of the following elements:
+
+* input textbox
+* checkbox to indicate whether to remove stopwords
+* predict button
+* data table that shows all the ngram matches and their probabilities
+* documentation tab that explains the product
+
+![](app.png)
+
+https://chrishan.shinyapps.io/finalwordprediction/ 
+
+## Conclusion
+
+The algorithm I used, namely the stupid backoff model, results in around 21.09% top three precision at its best. I In other words, in a SwiftKey-like experience where the application returns three predictions, our model would correctly predict 21.09% of the time, or about 1 out of every 5. In order for this product to be deployed and used, we need to employ a different algorithm that can drastically improve the performance. Possible models would involve smoothing such as the Kneser-Ney method.
+
+**Last Thoughts**
+
+The main challenge with this project was the large size of the text files and the even larger resulting corpus from tokenizing on the dataset. Because of the memory limits on the shiny application, I had to balance the accuracy of the model with real-life usability and speed. A model with 90% accuracy that takes two minutes to predict is arguably worse in terms of usability than a model with 20% accuracy but takes two seconds to predict. Nevertheless, this was a helpful introduction to the world of natural language processing and the various challenges associated with building a predictive model. In the future, I plan to revisit this project in order to try out different algorithms and improve the performance.
+
+
+
+
+
+
